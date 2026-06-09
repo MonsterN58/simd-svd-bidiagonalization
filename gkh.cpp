@@ -7,42 +7,129 @@
 #include <stdexcept>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#ifdef USE_PTHREAD
+#include <pthread.h>
+#include <atomic>
+#include <cstdlib>
+#include <thread>
+#ifdef __linux__
+#include <unistd.h>
+#endif
+#endif
+
 namespace
 {
 
     // 活动块 [l, r]（闭区间）表示一个尚未完全收敛的上二对角子问题。
-    // 在该区间内，超对角线元素非零，你可以认为通过这个抽象结构给矩阵“分块”。
+    // 在该区间内，超对角线元素非零，你可以认为通过这个抽象结构给矩阵"分块"。
     struct Block
     {
         int l;
         int r;
     };
 
+    // ===== 通用并行-for 调度 =====
+    // 优先级：USE_PTHREAD(无OpenMP时) > _OPENMP > 串行
+#if defined(USE_PTHREAD) && !defined(_OPENMP)
+    static int gkh_get_num_threads()
+    {
+        const char *env = std::getenv("OMP_NUM_THREADS");
+        if (env)
+        {
+            int n = std::atoi(env);
+            if (n > 0)
+                return n;
+        }
+#ifdef _WIN32
+        int n = static_cast<int>(std::thread::hardware_concurrency());
+#else
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+        return (n > 0) ? n : 4;
+    }
+
+    template <typename Func>
+    static void parallel_for(int start, int end, const Func &fn)
+    {
+        const int nt = gkh_get_num_threads();
+        if (nt <= 1 || end - start < 64)
+        {
+            for (int i = start; i < end; ++i)
+                fn(i);
+            return;
+        }
+        std::atomic<int> next{start};
+        struct Arg
+        {
+            std::atomic<int> *next;
+            int end;
+            const Func *fn;
+        } arg{&next, end, &fn};
+        auto worker = +[](void *p) -> void *
+        {
+            auto *a = static_cast<Arg *>(p);
+            for (;;)
+            {
+                int i = a->next->fetch_add(1, std::memory_order_relaxed);
+                if (i >= a->end)
+                    break;
+                (*a->fn)(i);
+            }
+            return nullptr;
+        };
+        std::vector<pthread_t> thr(nt - 1);
+        for (int t = 0; t < nt - 1; ++t)
+            pthread_create(&thr[t], nullptr, worker, &arg);
+        worker(&arg);
+        for (int t = 0; t < nt - 1; ++t)
+            pthread_join(thr[t], nullptr);
+    }
+#elif defined(_OPENMP)
+    template <typename Func>
+    static void parallel_for(int start, int end, const Func &fn)
+    {
+#pragma omp parallel for schedule(static)
+        for (int i = start; i < end; ++i)
+            fn(i);
+    }
+#else
+    template <typename Func>
+    static void parallel_for(int start, int end, const Func &fn)
+    {
+        for (int i = start; i < end; ++i)
+            fn(i);
+    }
+#endif
+
     // 对矩阵 M 的两行 r0, r1 左乘 Givens 旋转 [c s; -s c]。
     // 即 M <- L * M，其中 L 只作用在第 r0/r1 两行上。
     // 这类逐元素线性组合很适合向量化，SIMD/多线程中你也可以顺手的事把他们做了。
     static void apply_left_rows(Matrix &M, int r0, int r1, double c, double s)
     {
-        for (int j = 0; j < M.cols(); ++j)
-        {
+        const int ncols = M.cols();
+        parallel_for(0, ncols, [&](int j)
+                     {
             double a = M.at(r0, j);
             double b = M.at(r1, j);
             M.at(r0, j) = c * a + s * b;
-            M.at(r1, j) = -s * a + c * b;
-        }
+            M.at(r1, j) = -s * a + c * b; });
     }
 
     // 对矩阵 M 的两列 c0, c1 右乘 Givens 旋转 [c s; -s c]。
     // 即 M <- M * R，其中 R 只作用在第 c0/c1 两列上。
     static void apply_right_cols(Matrix &M, int c0, int c1, double c, double s)
     {
-        for (int i = 0; i < M.rows(); ++i)
-        {
+        const int nrows = M.rows();
+        parallel_for(0, nrows, [&](int i)
+                     {
             double a = M.at(i, c0);
             double b = M.at(i, c1);
             M.at(i, c0) = a * c - b * s;
-            M.at(i, c1) = a * s + b * c;
-        }
+            M.at(i, c1) = a * s + b * c; });
     }
 
     static void accumulate_left_into_U(Matrix &U, int r0, int r1, double c, double s)
@@ -53,7 +140,7 @@ namespace
         // 由于正交矩阵和其转置的乘积是I，一个自然的想法是让 U <- U * L^T。
         // 这样就变成 A = (U * L^T) * (L * B) * V^T = U * B * V^T，等式得以保持。
 
-        // 由于 L^T = [c -s; s c]，此处复用“右乘两列”接口并传入 -s。
+        // 由于 L^T = [c -s; s c]，此处复用"右乘两列"接口并传入 -s。
         apply_right_cols(U, r0, r1, c, -s);
     }
 
@@ -104,7 +191,7 @@ namespace
         }
     }
 
-    // 对活动块 [l, r] 执行一次“单块 GKH bulge chasing”迭代。
+    // 对活动块 [l, r] 执行一次"单块 GKH bulge chasing"迭代。
     // 流程：首次右乘引入 bulge -> 首次左乘消 bulge -> 交替右乘/左乘将 bulge 追赶到块末端。
     static void one_block_step(Matrix &U, Matrix &B, Matrix &V, int l, int r)
     {
@@ -145,7 +232,7 @@ namespace
         }
     }
 
-    // 处理“对角元 d_k 近零但超对角 e_k 未近零”的情况。
+    // 处理"对角元 d_k 近零但超对角 e_k 未近零"的情况。
     // 思路与单块追赶类似：先右乘把 e_i 消掉，再左乘清理新引入的次对角 bulge，
     // 把这个问题逐步向右传递，直到块末端。
     static bool chase_zero_diagonal(Matrix &U, Matrix &B, Matrix &V, int k, double tol)
@@ -217,7 +304,7 @@ namespace
         return changed;
     }
 
-    // 根据超对角线是否“足够小”对问题进行分块。
+    // 根据超对角线是否"足够小"对问题进行分块。
     // 若 |e_k| <= tol*(|d_k|+|d_{k+1}|+1)，认为该位置可解耦并直接置零。
     // 最终会得到一系列小矩阵。
     static std::vector<Block> split_active_blocks(Matrix &B, int n, double tol)
@@ -263,10 +350,8 @@ namespace
             if (B.at(i, i) < 0.0)
             {
                 B.at(i, i) = -B.at(i, i);
-                for (int r = 0; r < m; ++r)
-                {
-                    U.at(r, i) = -U.at(r, i);
-                }
+                parallel_for(0, m, [&](int r)
+                             { U.at(r, i) = -U.at(r, i); });
             }
         }
 
@@ -282,11 +367,10 @@ namespace
         Matrix V2 = V;
         Matrix D(B.rows(), B.cols(), 0.0);
 
-        for (int new_i = 0; new_i < n; ++new_i)
-        {
+        parallel_for(0, n, [&](int new_i)
+                     {
             const int old_i = idx[new_i];
             D.at(new_i, new_i) = B.at(old_i, old_i);
-
             for (int r = 0; r < U.rows(); ++r)
             {
                 U2.at(r, new_i) = U.at(r, old_i);
@@ -294,8 +378,7 @@ namespace
             for (int r = 0; r < V.rows(); ++r)
             {
                 V2.at(r, new_i) = V.at(r, old_i);
-            }
-        }
+            } });
 
         U = U2;
         V = V2;
@@ -304,7 +387,62 @@ namespace
 
 } // namespace
 
-// 从“上二对角矩阵 B”出发执行 Golub-Kahan SVD 迭代（改进版）：
+// ===== Pthread 块级并行（局部的并行） =====
+#ifdef USE_PTHREAD
+namespace
+{
+
+    // 静态线程池：在 gkh_svd_from_bidiagonal 整个生命周期内复用线程
+    // 每轮迭代：主线程做串行工作 → barrier 通知工作线程 → 所有线程处理块 → barrier 同步
+    struct GKHThreadPool
+    {
+        int num_threads;
+        pthread_t *workers;
+
+        // 当前任务数据
+        Matrix *U;
+        Matrix *B;
+        Matrix *V;
+        const std::vector<Block> *blocks;
+        std::atomic<int> next_idx;
+
+        // 同步原语
+        pthread_barrier_t iter_start;
+        pthread_barrier_t iter_end;
+        bool shutdown;
+    };
+
+    static void *gkh_pool_worker(void *arg)
+    {
+        GKHThreadPool *pool = static_cast<GKHThreadPool *>(arg);
+        while (true)
+        {
+            pthread_barrier_wait(&pool->iter_start);
+            if (pool->shutdown)
+                return nullptr;
+
+            // 动态调度：每个线程用 atomic 递减取下一个块索引
+            for (;;)
+            {
+                int idx = pool->next_idx.fetch_sub(1, std::memory_order_relaxed) - 1;
+                if (idx < 0)
+                    break;
+                const Block &blk = pool->blocks->at(idx);
+                if (blk.r > blk.l)
+                {
+                    one_block_step(*pool->U, *pool->B, *pool->V, blk.l, blk.r);
+                }
+            }
+
+            pthread_barrier_wait(&pool->iter_end);
+        }
+        return nullptr;
+    }
+
+} // namespace
+#endif
+
+// 从"上二对角矩阵 B"出发执行 Golub-Kahan SVD 迭代（改进版）：
 // - 输入输出满足 A = U * B * V^T 不变；
 // - 迭代中自动分块、处理对角近零、并在每个活动块上做 bulge chasing；
 // - 成功收敛后，B 被整理为非负且降序的对角矩阵（其对角元即奇异值）。
@@ -327,6 +465,27 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
     }
 
     bool converged = false;
+
+#ifdef USE_PTHREAD
+    // ---- Pthread 线程池初始化 ----
+    const int num_pthreads = gkh_get_num_threads();
+    GKHThreadPool pool;
+    if (num_pthreads > 1)
+    {
+        pool.num_threads = num_pthreads;
+        pool.U = &U;
+        pool.B = &B;
+        pool.V = &V;
+        pool.shutdown = false;
+        pthread_barrier_init(&pool.iter_start, nullptr, num_pthreads);
+        pthread_barrier_init(&pool.iter_end, nullptr, num_pthreads);
+        pool.workers = new pthread_t[num_pthreads - 1];
+        for (int t = 0; t < num_pthreads - 1; ++t)
+        {
+            pthread_create(&pool.workers[t], nullptr, gkh_pool_worker, &pool);
+        }
+    }
+#endif
 
     for (int iter = 0; iter < max_iter; ++iter)
     {
@@ -357,6 +516,45 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
         }
 
         // 从右到左处理每个非平凡块，减少末端块对前面块的干扰。
+#ifdef USE_PTHREAD
+        if (num_pthreads > 1)
+        {
+            // Pthread 块级并行：动态调度，各线程从 atomic 计数器取块索引
+            pool.blocks = &blocks;
+            pool.next_idx.store(static_cast<int>(blocks.size()), std::memory_order_relaxed);
+
+            // 通知工作线程开始处理
+            pthread_barrier_wait(&pool.iter_start);
+
+            // 主线程也参与处理块
+            for (;;)
+            {
+                int idx = pool.next_idx.fetch_sub(1, std::memory_order_relaxed) - 1;
+                if (idx < 0)
+                    break;
+                const Block &blk = blocks[idx];
+                if (blk.r > blk.l)
+                {
+                    one_block_step(U, B, V, blk.l, blk.r);
+                }
+            }
+
+            // 等待所有线程完成本轮迭代
+            pthread_barrier_wait(&pool.iter_end);
+        }
+        else
+        {
+            // 单线程回退
+            for (int i = static_cast<int>(blocks.size()) - 1; i >= 0; --i)
+            {
+                if (blocks[i].r > blocks[i].l)
+                {
+                    one_block_step(U, B, V, blocks[i].l, blocks[i].r);
+                }
+            }
+        }
+#else
+        // 串行 / OpenMP 版本
         for (int i = static_cast<int>(blocks.size()) - 1; i >= 0; --i)
         {
             if (blocks[i].r > blocks[i].l)
@@ -364,7 +562,25 @@ bool gkh_svd_from_bidiagonal(Matrix &U, Matrix &B, Matrix &V, int max_iter, doub
                 one_block_step(U, B, V, blocks[i].l, blocks[i].r);
             }
         }
+#endif
     }
+
+#ifdef USE_PTHREAD
+    // ---- Pthread 线程池关闭 ----
+    if (num_pthreads > 1)
+    {
+        pool.shutdown = true;
+        // 释放等待在 iter_start 上的工作线程
+        pthread_barrier_wait(&pool.iter_start);
+        for (int t = 0; t < num_pthreads - 1; ++t)
+        {
+            pthread_join(pool.workers[t], nullptr);
+        }
+        pthread_barrier_destroy(&pool.iter_start);
+        pthread_barrier_destroy(&pool.iter_end);
+        delete[] pool.workers;
+    }
+#endif
 
     // 迭代结束后统一结构清理与标准化输出。
     cleanup_bidiagonal(B, tol);

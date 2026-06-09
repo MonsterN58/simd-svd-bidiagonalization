@@ -1,0 +1,75 @@
+MPI SVD 测试 (8 进程)
+
+=== 固定值 5x5 ===
+  converged                 : yes
+  ||A-U*S*V^T||_F           : 3.87142e-12
+  relative recon error      : 2.7672e-13
+  ||U^T U-I||_F             : 1.03536e-15
+  ||V^T V-I||_F             : 1.55488e-15
+  diagonal structure error  : 0
+  descending order error    : 0
+  nonnegative diagonal      : yes
+  time bidiagonalization(ms): 0.268936
+  time gkh iteration(ms)    : 0.128984
+  结果: PASS
+
+=== 随机 8x8 ===
+  converged                 : yes
+  ||A-U*S*V^T||_F           : 1.44539e-14
+  relative recon error      : 9.15979e-16
+  ||U^T U-I||_F             : 2.40539e-15
+  ||V^T V-I||_F             : 2.64504e-15
+  diagonal structure error  : 0
+  descending order error    : 0
+  nonnegative diagonal      : yes
+  time bidiagonalization(ms): 0.360012
+  time gkh iteration(ms)    : 0.168324
+  结果: PASS
+
+=== 近秩亏损 10x8 ===
+  converged                 : yes
+  ||A-U*S*V^T||_F           : 9.75933e-15
+  relative recon error      : 7.87989e-16
+  ||U^T U-I||_F             : 1.82872e-15
+  ||V^T V-I||_F             : 1.80436e-15
+  diagonal structure error  : 0
+  descending order error    : 0
+  nonnegative diagonal      : yes
+  time bidiagonalization(ms): 0.393152
+  time gkh iteration(ms)    : 0.188351
+  结果: PASS
+
+=== 随机 10x8 ===
+  converged                 : yes
+  ||A-U*S*V^T||_F           : 1.27446e-12
+  relative recon error      : 5.84961e-14
+  ||U^T U-I||_F             : 1.87744e-15
+  ||V^T V-I||_F             : 2.55425e-15
+  diagonal structure error  : 0
+  descending order error    : 0
+  nonnegative diagonal      : yes
+  time bidiagonalization(ms): 0.393391
+  time gkh iteration(ms)    : 0.17643
+  结果: PASS
+
+=== 随机 1000x1000 ===
+  converged                 : yes
+  ||A-U*S*V^T||_F           : 2.06337e-10
+  relative recon error      : 3.56975e-13
+  ||U^T U-I||_F             : 2.34328e-13
+  ||V^T V-I||_F             : 2.34008e-13
+  diagonal structure error  : 0
+  descending order error    : 0
+  nonnegative diagonal      : yes
+  time bidiagonalization(ms): 51748.8
+  time gkh iteration(ms)    : 46312.9
+  结果: PASS
+
+==============================
+MPI 进程数: 8
+随机种子基值: 20260408
+总上二对角化耗时(ms): 51750.2
+总GKH迭代耗时(ms): 46313.5
+通过: 5 / 5
+
+Authorized users only. All activities may be monitored and reported.

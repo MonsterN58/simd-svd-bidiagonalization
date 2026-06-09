@@ -1,0 +1,43 @@
+# Makefile.mpi
+# MPI 版 SVD 编译脚本
+# 用法:
+#   make -f Makefile.mpi              # 编译 main_mpi 和 bench_mpi
+#   make -f Makefile.mpi main_mpi     # 只编译主测试程序
+#   make -f Makefile.mpi bench_mpi    # 只编译benchmark
+#   make -f Makefile.mpi clean        # 清理
+#
+# 运行:
+#   mpiexec -n 4 ./main_mpi [seed]
+#   mpiexec -n 4 ./bench_mpi 500 20260408 3
+
+CXX       = mpicxx
+CXXFLAGS  = -std=c++17 -O2 -Wall
+# 如需混合 MPI+OpenMP，取消下面注释:
+# CXXFLAGS += -fopenmp -DUSE_OPENMP
+
+# SIMD 自动检测（ARM 服务器上可能需要调整）
+CXXFLAGS += -march=native
+
+LDFLAGS   =
+
+# 目标
+all: main_mpi bench_mpi
+
+# ---- main_mpi: MPI 版主测试程序 ----
+MAIN_MPI_SRCS = main_mpi.cpp bidiag_mpi.cpp gkh_mpi.cpp
+MAIN_MPI_HDRS = matrix.h givens.h bidiag_mpi.h gkh_mpi.h
+
+main_mpi: $(MAIN_MPI_SRCS) $(MAIN_MPI_HDRS)
+	$(CXX) $(CXXFLAGS) -o $@ $(MAIN_MPI_SRCS) $(LDFLAGS)
+
+# ---- bench_mpi: MPI 版 benchmark ----
+BENCH_MPI_SRCS = bench_mpi.cpp bidiag_mpi.cpp gkh_mpi.cpp
+BENCH_MPI_HDRS = matrix.h givens.h bidiag_mpi.h gkh_mpi.h
+
+bench_mpi: $(BENCH_MPI_SRCS) $(BENCH_MPI_HDRS)
+	$(CXX) $(CXXFLAGS) -o $@ $(BENCH_MPI_SRCS) $(LDFLAGS)
+
+clean:
+	rm -f main_mpi bench_mpi *.o
+
+.PHONY: all clean

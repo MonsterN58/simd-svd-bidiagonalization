@@ -22,6 +22,20 @@
 #include <stdexcept>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#ifdef USE_PTHREAD
+#include <pthread.h>
+#include <atomic>
+#include <cstdlib>
+#include <thread>
+#ifdef __linux__
+#include <unistd.h>
+#endif
+#endif
+
 #if defined(ENABLE_BIDIAG_PROFILE)
 #include <chrono>
 #include <iostream>
@@ -29,6 +43,119 @@
 
 #if !defined(DISABLE_MANUAL_SIMD) && (defined(__AVX512F__) || defined(__AVX__) || defined(__SSE2__))
 #include <immintrin.h>
+#endif
+
+// ===== 通用并行-for 调度 =====
+#if defined(USE_PTHREAD) && !defined(_OPENMP)
+static int bidiag_get_num_threads()
+{
+    const char *env = std::getenv("OMP_NUM_THREADS");
+    if (env)
+    {
+        int n = std::atoi(env);
+        if (n > 0)
+            return n;
+    }
+#ifdef _WIN32
+    int n = static_cast<int>(std::thread::hardware_concurrency());
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    return (n > 0) ? n : 4;
+}
+
+template <typename Func>
+static void parallel_for(int start, int end, const Func &fn)
+{
+    const int nt = bidiag_get_num_threads();
+    if (nt <= 1 || end - start < 64)
+    {
+        for (int i = start; i < end; ++i)
+            fn(i);
+        return;
+    }
+    std::atomic<int> next{start};
+    struct Arg
+    {
+        std::atomic<int> *next;
+        int end;
+        const Func *fn;
+    } arg{&next, end, &fn};
+    auto worker = +[](void *p) -> void *
+    {
+        auto *a = static_cast<Arg *>(p);
+        for (;;)
+        {
+            int i = a->next->fetch_add(1, std::memory_order_relaxed);
+            if (i >= a->end)
+                break;
+            (*a->fn)(i);
+        }
+        return nullptr;
+    };
+    std::vector<pthread_t> thr(nt - 1);
+    for (int t = 0; t < nt - 1; ++t)
+        pthread_create(&thr[t], nullptr, worker, &arg);
+    worker(&arg);
+    for (int t = 0; t < nt - 1; ++t)
+        pthread_join(thr[t], nullptr);
+}
+
+// Pthread 版本的带线程ID并行-for（用于 w 累积的线程局部缓冲区）
+template <typename Func>
+static void parallel_for_tid(int start, int end, int nt, const Func &fn)
+{
+    if (nt <= 1 || end - start < 64)
+    {
+        for (int i = start; i < end; ++i)
+            fn(i, 0);
+        return;
+    }
+    std::atomic<int> next{start};
+    struct Arg
+    {
+        std::atomic<int> *next;
+        int end;
+        int nt;
+        const Func *fn;
+    } arg{&next, end, nt, &fn};
+    auto worker = +[](void *p) -> void *
+    {
+        auto *a = static_cast<Arg *>(p);
+        // 通过 atomic 计数器分配一个 tid
+        static std::atomic<int> tid_counter{0};
+        int tid = tid_counter.fetch_add(1, std::memory_order_relaxed);
+        for (;;)
+        {
+            int i = a->next->fetch_add(1, std::memory_order_relaxed);
+            if (i >= a->end)
+                break;
+            (*a->fn)(i, tid % a->nt);
+        }
+        return nullptr;
+    };
+    std::vector<pthread_t> thr(nt - 1);
+    for (int t = 0; t < nt - 1; ++t)
+        pthread_create(&thr[t], nullptr, worker, &arg);
+    worker(&arg);
+    for (int t = 0; t < nt - 1; ++t)
+        pthread_join(thr[t], nullptr);
+}
+#elif defined(_OPENMP)
+template <typename Func>
+static void parallel_for(int start, int end, const Func &fn)
+{
+#pragma omp parallel for schedule(static)
+    for (int i = start; i < end; ++i)
+        fn(i);
+}
+#else
+template <typename Func>
+static void parallel_for(int start, int end, const Func &fn)
+{
+    for (int i = start; i < end; ++i)
+        fn(i);
+}
 #endif
 
 #if defined(ENABLE_BIDIAG_PROFILE)
@@ -255,18 +382,43 @@ Matrix to_bidiagonal(const Matrix &A, Matrix &U, Matrix &V)
                 // 手册里的 Householder 矩阵定义为 H = I - beta * v * v^T，其中 beta = 2 / (v^T v)
                 // 从左侧作用 H：B_new = H * B_old = B_old - beta * v * (v^T * B_old)
                 std::vector<double> w(n - k, 0.0);
+#if defined(USE_PTHREAD) && !defined(_OPENMP)
+                {
+                    const int nt = bidiag_get_num_threads();
+                    std::vector<std::vector<double>> w_bufs(nt, std::vector<double>(n - k, 0.0));
+                    parallel_for_tid(0, m - k, nt, [&](int i, int tid)
+                                     { add_scaled_contiguous(w_bufs[tid].data(), &B.at(k + i, k), n - k, v[i]); });
+                    for (int t = 0; t < nt; ++t)
+                        add_scaled_contiguous(w.data(), w_bufs[t].data(), n - k, 1.0);
+                }
+#elif defined(_OPENMP)
+                {
+                    const int nt = omp_get_max_threads();
+                    std::vector<std::vector<double>> w_bufs(nt, std::vector<double>(n - k, 0.0));
+#pragma omp parallel
+                    {
+                        const int tid = omp_get_thread_num();
+#pragma omp for schedule(static)
+                        for (int i = 0; i < m - k; ++i)
+                            add_scaled_contiguous(w_bufs[tid].data(), &B.at(k + i, k), n - k, v[i]);
+                    }
+                    for (int t = 0; t < nt; ++t)
+                        add_scaled_contiguous(w.data(), w_bufs[t].data(), n - k, 1.0);
+                }
+#else
                 for (int i = 0; i < m - k; ++i)
                     add_scaled_contiguous(w.data(), &B.at(k + i, k), n - k, v[i]);
-                for (int i = 0; i < m - k; ++i)
-                    add_scaled_contiguous(&B.at(k + i, k), w.data(), n - k, -beta * v[i]);
+#endif
+                parallel_for(0, m - k, [&](int i)
+                             { add_scaled_contiguous(&B.at(k + i, k), w.data(), n - k, -beta * v[i]); });
 
                 // 累积 U：U_new = U_old * H_k
                 // U[:, k:m] -= beta * (U[:, k:m] * v) * v^T
                 std::vector<double> wU(m, 0.0);
-                for (int i = 0; i < m; ++i)
-                    wU[i] = dot_contiguous(&U.at(i, k), v.data(), m - k);
-                for (int i = 0; i < m; ++i)
-                    add_scaled_contiguous(&U.at(i, k), v.data(), m - k, -beta * wU[i]);
+                parallel_for(0, m, [&](int i)
+                             { wU[i] = dot_contiguous(&U.at(i, k), v.data(), m - k); });
+                parallel_for(0, m, [&](int i)
+                             { add_scaled_contiguous(&U.at(i, k), v.data(), m - k, -beta * wU[i]); });
             }
         }
 
@@ -312,18 +464,18 @@ Matrix to_bidiagonal(const Matrix &A, Matrix &U, Matrix &V)
                     // 注意：这里是从右侧作用 V_k
                     // B_new = B_old * V_k = B_old - beta * (B_old * v) * v^T
                     std::vector<double> w(m - k, 0.0);
-                    for (int i = 0; i < m - k; ++i)
-                        w[i] = dot_contiguous(&B.at(k + i, k + 1), v.data(), n - k - 1);
-                    for (int i = 0; i < m - k; ++i)
-                        add_scaled_contiguous(&B.at(k + i, k + 1), v.data(), n - k - 1, -beta * w[i]);
+                    parallel_for(0, m - k, [&](int i)
+                                 { w[i] = dot_contiguous(&B.at(k + i, k + 1), v.data(), n - k - 1); });
+                    parallel_for(0, m - k, [&](int i)
+                                 { add_scaled_contiguous(&B.at(k + i, k + 1), v.data(), n - k - 1, -beta * w[i]); });
 
                     // 累积 V：V_new = V_old * V_k
                     // V[:, k+1:n] -= beta * (V[:, k+1:n] * v) * v^T
                     std::vector<double> wV(n, 0.0);
-                    for (int i = 0; i < n; ++i)
-                        wV[i] = dot_contiguous(&V.at(i, k + 1), v.data(), n - k - 1);
-                    for (int i = 0; i < n; ++i)
-                        add_scaled_contiguous(&V.at(i, k + 1), v.data(), n - k - 1, -beta * wV[i]);
+                    parallel_for(0, n, [&](int i)
+                                 { wV[i] = dot_contiguous(&V.at(i, k + 1), v.data(), n - k - 1); });
+                    parallel_for(0, n, [&](int i)
+                                 { add_scaled_contiguous(&V.at(i, k + 1), v.data(), n - k - 1, -beta * wV[i]); });
                 }
             }
 
